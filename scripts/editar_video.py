@@ -4,21 +4,28 @@
 Etapas: transcreve (Whisper) -> corta silêncios -> enquadra o rosto em 9:16
 -> grava legenda estilo Reels -> adiciona trilha com ducking -> normaliza áudio.
 
-Uso:
-    python3 scripts/editar_video.py VIDEO [-o PASTA] [--formato 9x16|original]
-        [--musica sintetica|nenhuma|ARQUIVO] [--pausa 0.6] [--modelo medium]
-        [--idioma pt] [--clarear]
+Uso (um ou vários vídeos, ou pastas inteiras):
+    python3 scripts/editar_video.py VIDEO [VIDEO ... | PASTA] [-o PASTA_SAIDA]
+        [--formato 9x16|original] [--musica sintetica|nenhuma|ARQUIVO]
+        [--pausa 0.6] [--modelo medium] [--idioma pt] [--clarear] [--refazer]
 
-Saídas em PASTA (padrão: saida/<nome-do-video>/):
-    video_final.mp4, legenda.srt, transcricao.txt, relatorio.json
+Saídas em PASTA_SAIDA/<nome-do-video>/ (padrão: saida/):
+    video_final.mp4, capa.jpg, legenda.srt, transcricao.txt, relatorio.json
+Resumo do lote: PASTA_SAIDA/resumo_lote.json
+
+Vídeos já prontos são pulados (use --refazer). A transcrição fica em cache em
+palavras.json: rodar de novo (ex.: depois de editar correcoes.json) não re-transcreve.
 """
-import argparse, json, re, subprocess, sys, wave
+import argparse, json, re, subprocess, sys, time, wave
 from pathlib import Path
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 SR_MUS = 44100
+EXT_VIDEO = {".mov", ".mp4", ".m4v", ".mkv", ".avi", ".webm", ".3gp"}
+LIMITE_REELS = 180  # segundos (Reels aceita até 3 min)
+_MODELO = {}
 OUT_W, OUT_H = 1080, 1920
 
 
@@ -37,8 +44,10 @@ def transcrever(video, work, modelo, idioma):
     run(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-map", "0:a:0", "-ac", "1", "-ar", "16000", str(wav)])
     with wave.open(str(wav)) as w:
         audio = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768
-    from faster_whisper import WhisperModel  # import tardio: só carrega se precisar
-    m = WhisperModel(modelo, device="cpu", compute_type="int8")
+    if modelo not in _MODELO:  # carrega uma vez só por lote
+        from faster_whisper import WhisperModel
+        _MODELO[modelo] = WhisperModel(modelo, device="cpu", compute_type="int8")
+    m = _MODELO[modelo]
     segs, _ = m.transcribe(audio, language=idioma, word_timestamps=True, vad_filter=True)
     return [{"w": w.word.strip(), "s": w.start, "e": w.end} for s in segs for w in s.words if w.word.strip()]
 
@@ -154,6 +163,7 @@ def montar_legendas(words, total, res, work):
                            for k, x in enumerate(ch))
             ev.append(f"Dialogue: 0,{ts_ass(ini)},{ts_ass(fim)},Reels,,0,0,0,,{{\\fad(40,0)}}{txt}")
     (work / "legenda.srt").write_text("\n".join(srt), encoding="utf-8")
+    montar_legendas.primeiro = (chunks[0][0]["s"] + (chunks[1][0]["s"] if len(chunks) > 1 else total)) / 2 if chunks else 0.5
     (work / "legenda.ass").write_text(f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {W}
@@ -227,10 +237,65 @@ def renderizar(video, work, keep, total, vfiltro, upscale, clarear, musica):
     return out
 
 
+def processar(video, work, a):
+    work.mkdir(parents=True, exist_ok=True)
+    dur = duracao(video)
+    cache = work / "palavras.json"
+    if cache.exists() and not a.retranscrever:
+        words = json.loads(cache.read_text(encoding="utf-8"))
+    else:
+        words = transcrever(video, work, a.modelo, a.idioma)
+        cache.write_text(json.dumps(words, ensure_ascii=False, indent=1), encoding="utf-8")
+    words = aplicar_correcoes(words, a.correcoes)
+
+    keep = trechos_com_fala(words, dur, a.pausa)
+    total = sum(y - x for x, y in keep)
+    for w in words:
+        w["s"], w["e"] = remapear(w["s"], keep), remapear(w["e"], keep)
+    centro, size = centro_do_rosto(video, work, dur)
+    vfiltro, res, upscale = filtro_enquadramento(a.formato, centro, size)
+
+    montar_legendas(words, total, res, work)
+    (work / "transcricao.txt").write_text(" ".join(w["w"] for w in words) + "\n", encoding="utf-8")
+    out = renderizar(video, work, keep, total, vfiltro, upscale, a.clarear, a.musica)
+    # Capa: quadro com a primeira legenda (o Instagram deixa escolher a capa)
+    run(["ffmpeg", "-y", "-v", "error", "-ss", f"{min(montar_legendas.primeiro, total - 0.1):.2f}", "-i", str(out),
+         "-frames:v", "1", "-q:v", "2", str(work / "capa.jpg")])
+
+    avisos = []
+    if min(size) < 1080:
+        avisos.append(f"Baixa resolução ({size[0]}x{size[1]}): ampliado {upscale:.1f}x, vai parecer suave. Grave em 1080p ou 4K.")
+    if centro is None and a.formato == "9x16":
+        avisos.append("Rosto não detectado: recorte centralizado. Confira o enquadramento.")
+    if not words:
+        avisos.append("Nenhuma fala detectada: sem legenda e sem corte.")
+    if total > LIMITE_REELS:
+        avisos.append(f"Ficou com {total:.0f}s: passa do limite de {LIMITE_REELS}s do Reels.")
+    rel = {"entrada": str(video), "saida": str(out), "capa": str(work / "capa.jpg"),
+           "duracao_original": round(dur, 2), "duracao_final": round(total, 2),
+           "trechos_mantidos": [[round(x, 2), round(y, 2)] for x, y in keep], "resolucao_original": size,
+           "resolucao_final": res, "centro_rosto": centro, "transcricao": " ".join(w["w"] for w in words), "avisos": avisos}
+    (work / "relatorio.json").write_text(json.dumps(rel, ensure_ascii=False, indent=2), encoding="utf-8")
+    return rel
+
+
+def listar_videos(entradas):
+    vids = []
+    for e in entradas:
+        e = e.resolve()
+        if e.is_dir():
+            vids += sorted(f for f in e.rglob("*") if f.suffix.lower() in EXT_VIDEO)
+        elif e.exists():
+            vids.append(e)
+        else:
+            print(f"!! não encontrado: {e}", file=sys.stderr)
+    return list(dict.fromkeys(vids))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("video", type=Path)
-    ap.add_argument("-o", "--saida", type=Path)
+    ap.add_argument("videos", type=Path, nargs="+", help="arquivos de vídeo e/ou pastas")
+    ap.add_argument("-o", "--saida", type=Path, default=Path.cwd() / "saida")
     ap.add_argument("--formato", choices=["9x16", "original"], default="9x16")
     ap.add_argument("--musica", default="sintetica", help="sintetica | nenhuma | caminho de um arquivo de áudio")
     ap.add_argument("--pausa", type=float, default=0.6, help="pausas maiores que isso (s) são cortadas")
@@ -238,49 +303,38 @@ def main():
     ap.add_argument("--idioma", default="pt")
     ap.add_argument("--clarear", action="store_true", help="clareia levemente (rosto contra a luz)")
     ap.add_argument("--correcoes", type=Path, default=ROOT / "correcoes.json")
-    ap.add_argument("--palavras", type=Path, help="JSON de palavras já transcritas (pula o Whisper)")
+    ap.add_argument("--refazer", action="store_true", help="refaz vídeos que já têm video_final.mp4")
+    ap.add_argument("--retranscrever", action="store_true", help="ignora o cache palavras.json")
     a = ap.parse_args()
 
-    video = a.video.resolve()
-    work = (a.saida or Path.cwd() / "saida" / video.stem).resolve(); work.mkdir(parents=True, exist_ok=True)
-    dur = duracao(video)
-
-    print("1/4 Transcrevendo...", flush=True)
-    words = json.loads(a.palavras.read_text()) if a.palavras else transcrever(video, work, a.modelo, a.idioma)
-    (work / "palavras.json").write_text(json.dumps(words, ensure_ascii=False, indent=1), encoding="utf-8")
-    words = aplicar_correcoes(words, a.correcoes)
-
-    print("2/4 Cortando silêncios e enquadrando...", flush=True)
-    keep = trechos_com_fala(words, dur, a.pausa)
-    total = sum(b - a_ for a_, b in keep)
-    for w in words:
-        w["s"], w["e"] = remapear(w["s"], keep), remapear(w["e"], keep)
-    centro, size = centro_do_rosto(video, work, dur)
-    vfiltro, res, upscale = filtro_enquadramento(a.formato, centro, size)
-
-    print("3/4 Gerando legendas...", flush=True)
-    montar_legendas(words, total, res, work)
-    (work / "transcricao.txt").write_text(" ".join(w["w"] for w in words) + "\n", encoding="utf-8")
-
-    print("4/4 Renderizando...", flush=True)
-    out = renderizar(video, work, keep, total, vfiltro, upscale, a.clarear, a.musica)
-
-    avisos = []
-    if min(size) < 1080:
-        avisos.append(f"Original em baixa resolução ({size[0]}x{size[1]}): ampliado {upscale:.1f}x, vai parecer suave. Grave em 1080p ou 4K.")
-    if centro is None and a.formato == "9x16":
-        avisos.append("Rosto não detectado: recorte centralizado. Confira o enquadramento.")
-    if not words:
-        avisos.append("Nenhuma fala detectada: sem legenda e sem corte.")
-    rel = {"entrada": str(video), "saida": str(out), "duracao_original": round(dur, 2), "duracao_final": round(total, 2),
-           "trechos_mantidos": [[round(x, 2), round(y, 2)] for x, y in keep], "resolucao_original": size,
-           "resolucao_final": res, "centro_rosto": centro, "transcricao": " ".join(w["w"] for w in words), "avisos": avisos}
-    (work / "relatorio.json").write_text(json.dumps(rel, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(rel, ensure_ascii=False, indent=2))
+    videos = listar_videos(a.videos)
+    if not videos:
+        sys.exit("Nenhum vídeo encontrado.")
+    base = a.saida.resolve(); base.mkdir(parents=True, exist_ok=True)
+    resultados = []
+    for i, v in enumerate(videos, 1):
+        work = base / v.stem
+        if (work / "video_final.mp4").exists() and (work / "relatorio.json").exists() and not a.refazer:
+            print(f"[{i}/{len(videos)}] {v.name}: já pronto, pulando (use --refazer)", flush=True)
+            resultados.append({**json.loads((work / "relatorio.json").read_text(encoding="utf-8")), "status": "pulado"})
+            continue
+        print(f"[{i}/{len(videos)}] {v.name}: processando...", flush=True)
+        t0 = time.time()
+        try:
+            rel = processar(v, work, a)
+            rel["status"] = "ok"
+            print(f"    ok em {time.time() - t0:.0f}s: {rel['duracao_original']}s -> {rel['duracao_final']}s"
+                  + "".join(f"\n    aviso: {x}" for x in rel["avisos"]), flush=True)
+        except Exception as e:  # um vídeo com problema não derruba o lote
+            msg = e.stderr[-500:] if isinstance(e, subprocess.CalledProcessError) else repr(e)
+            rel = {"entrada": str(v), "status": "erro", "erro": msg}
+            print(f"    ERRO: {msg}", flush=True)
+        resultados.append(rel)
+    (base / "resumo_lote.json").write_text(json.dumps(resultados, ensure_ascii=False, indent=2), encoding="utf-8")
+    ok = sum(r["status"] != "erro" for r in resultados)
+    print(f"\nLote: {ok}/{len(resultados)} prontos. Resumo em {base / 'resumo_lote.json'}")
+    sys.exit(0 if ok == len(resultados) else 1)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except subprocess.CalledProcessError as e:
-        sys.exit(f"Erro no comando: {' '.join(map(str, e.cmd))[:300]}\n{e.stderr}")
+    main()
