@@ -8,6 +8,9 @@ WORK = OUT.parent
 KEEP = [(1.55, 3.15), (5.40, 9.95), (12.25, 15.55)]
 FIX = {"Claudio,": "Claude,"}  # Whisper ouviu "Claudio"
 SR = 44100
+# Formato 9:16 (Reels/TikTok/Shorts): recorte fixo que mantém o rosto inteiro
+CROP = "crop=270:480:60:0"
+W, H = 1080, 1920
 
 # ---- 1. Remapear tempos das palavras para a linha do tempo cortada
 words = json.load(open(WORDS))
@@ -28,7 +31,10 @@ def ts(t):
     t = max(0, t); h = int(t // 3600); m = int(t % 3600 // 60); s = t % 60
     return f"{h}:{m:02d}:{s:05.2f}"
 chunks, cur = [], []
+MAXC = 16  # caracteres por bloco: cabe em uma linha no 9:16
 for w in words:
+    if cur and len(" ".join(x["w"] for x in cur + [w])) > MAXC:
+        chunks.append(cur); cur = []
     cur.append(w)
     if len(cur) == 3 or w["w"][-1] in ",.!?":
         chunks.append(cur); cur = []
@@ -50,13 +56,13 @@ for i, ch in enumerate(chunks):
 (WORK / "legenda.srt").write_text("\n".join(srt).replace("0:00:", "00:00:"), encoding="utf-8")
 (WORK / "legenda.ass").write_text(f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 720
-PlayResY: 960
+PlayResX: {W}
+PlayResY: {H}
 WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Reels,Inter Display,64,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,1,0,1,5,2,2,40,40,230,1
+Style: Reels,Inter Display,92,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,1,0,1,7,3,2,70,70,520,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -94,7 +100,7 @@ parts = "".join(f"[0:v]trim={a}:{b},setpts=PTS-STARTPTS[v{i}];[0:a:0]atrim={a}:{
                 f"afade=t=in:d=0.04,afade=t=out:st={b-a-0.04}:d=0.04[a{i}];" for i, (a, b) in enumerate(KEEP))
 cat = "".join(f"[v{i}][a{i}]" for i in range(len(KEEP))) + f"concat=n={len(KEEP)}:v=1:a=1[vc][ac];"
 fc = (parts + cat +
-      "[vc]scale=720:960:flags=lanczos,ass=" + str(WORK / "legenda.ass") + "[vout];"
+      f"[vc]{CROP},scale={W}:{H}:flags=lanczos,eq=brightness=0.03:gamma=1.08:saturation=1.05,unsharp=5:5:0.6,ass=" + str(WORK / "legenda.ass") + "[vout];"
       "[ac]highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=11,asplit[voz][sc];"
       f"[1:a]atrim=0:{total},volume=0.35,aresample=48000[mus];"
       "[mus][sc]sidechaincompress=threshold=0.03:ratio=6:attack=20:release=400[duck];"
